@@ -84,7 +84,7 @@ func (f *ComponentFunc) Call(store Storelike, args ...interface{}) (interface{},
 		if !bool(C.wasmtime_component_func_type_param_nth(fty, C.size_t(i), &nameP, &nameLen, &paramTy)) {
 			return nil, fmt.Errorf("could not retrieve parameter %d", i)
 		}
-		err := componentMarshalArg(args[i], paramTy.kind, &cArgs[i])
+		err := componentMarshalArg(args[i], &paramTy, &cArgs[i])
 		C.wasmtime_component_valtype_delete(&paramTy)
 		if err != nil {
 			return nil, fmt.Errorf("argument %d: %w", i, err)

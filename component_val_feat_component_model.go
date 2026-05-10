@@ -45,6 +45,36 @@ package wasmtime
 // }
 // static inline const char *go_component_val_string_data(const wasmtime_component_val_t *v) { return v->of.string.data; }
 // static inline size_t go_component_val_string_size(const wasmtime_component_val_t *v) { return v->of.string.size; }
+//
+// // valtype union accessors. cgo cannot reach into a C union directly so we
+// // expose typed pointer getters here. The valtype itself is owned by the
+// // caller (e.g. obtained via wasmtime_component_func_type_param_nth) and
+// // these accessors do not transfer ownership.
+// static inline const wasmtime_component_list_type_t *go_valtype_list(const wasmtime_component_valtype_t *t) { return t->of.list; }
+// static inline const wasmtime_component_record_type_t *go_valtype_record(const wasmtime_component_valtype_t *t) { return t->of.record; }
+//
+// // list val helpers. The value's `of.list` is a vec of component_val_t.
+// static inline void go_component_val_init_list(wasmtime_component_val_t *v, size_t n) {
+//   wasmtime_component_vallist_new_uninit(&v->of.list, n);
+// }
+// static inline wasmtime_component_val_t *go_component_val_list_nth(wasmtime_component_val_t *v, size_t i) { return &v->of.list.data[i]; }
+// static inline size_t go_component_val_list_size(const wasmtime_component_val_t *v) { return v->of.list.size; }
+// static inline const wasmtime_component_val_t *go_component_val_list_get(const wasmtime_component_val_t *v, size_t i) { return &v->of.list.data[i]; }
+//
+// // record val helpers. The value's `of.record` is a vec of valrecord_entry_t.
+// static inline void go_component_val_init_record(wasmtime_component_val_t *v, size_t n) {
+//   wasmtime_component_valrecord_new_uninit(&v->of.record, n);
+// }
+// static inline wasmtime_component_val_t *go_component_val_record_set_name(wasmtime_component_val_t *v, size_t i, const char *name, size_t name_len) {
+//   wasmtime_component_valrecord_entry_t *e = &v->of.record.data[i];
+//   wasm_name_new_uninitialized(&e->name, name_len);
+//   if (name_len > 0) memcpy(e->name.data, name, name_len);
+//   return &e->val;
+// }
+// static inline size_t go_component_val_record_size(const wasmtime_component_val_t *v) { return v->of.record.size; }
+// static inline const char *go_component_val_record_name(const wasmtime_component_val_t *v, size_t i) { return v->of.record.data[i].name.data; }
+// static inline size_t go_component_val_record_name_size(const wasmtime_component_val_t *v, size_t i) { return v->of.record.data[i].name.size; }
+// static inline const wasmtime_component_val_t *go_component_val_record_get(const wasmtime_component_val_t *v, size_t i) { return &v->of.record.data[i].val; }
 import "C"
 
 import (
@@ -53,10 +83,13 @@ import (
 )
 
 // componentMarshalArg writes the Go value `arg` into the C-side `out` slot,
-// matching the WIT type discriminated by `kind` (a valtype kind, not a val
-// kind). Only primitive WIT types are supported in this version.
-func componentMarshalArg(arg interface{}, kind C.wasmtime_component_valtype_kind_t, out *C.wasmtime_component_val_t) error {
-	switch kind {
+// matching the WIT type described by `ty`. Supports primitive types, string,
+// list<T>, and record { ... }. Composite types recurse into the appropriate
+// field types via the same function.
+//
+// `ty` is owned by the caller and is not consumed.
+func componentMarshalArg(arg interface{}, ty *C.wasmtime_component_valtype_t, out *C.wasmtime_component_val_t) error {
+	switch ty.kind {
 	case C.WASMTIME_COMPONENT_VALTYPE_BOOL:
 		v, ok := arg.(bool)
 		if !ok {
@@ -150,13 +183,66 @@ func componentMarshalArg(arg interface{}, kind C.wasmtime_component_valtype_kind
 		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_STRING)
 		C.go_component_val_set_string(out, C._GoStringPtr(v), C._GoStringLen(v))
 		runtime.KeepAlive(v)
+	case C.WASMTIME_COMPONENT_VALTYPE_LIST:
+		items, ok := arg.([]interface{})
+		if !ok {
+			return componentArgMismatch("[]interface{}", arg)
+		}
+		listTy := C.go_valtype_list(ty)
+		var elemTy C.wasmtime_component_valtype_t
+		C.wasmtime_component_list_type_element(listTy, &elemTy)
+		defer C.wasmtime_component_valtype_delete(&elemTy)
+		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_LIST)
+		C.go_component_val_init_list(out, C.size_t(len(items)))
+		for i, item := range items {
+			slot := C.go_component_val_list_nth(out, C.size_t(i))
+			if err := componentMarshalArg(item, &elemTy, slot); err != nil {
+				return fmt.Errorf("list[%d]: %w", i, err)
+			}
+		}
+	case C.WASMTIME_COMPONENT_VALTYPE_RECORD:
+		entries, ok := arg.(map[string]interface{})
+		if !ok {
+			return componentArgMismatch("map[string]interface{}", arg)
+		}
+		recordTy := C.go_valtype_record(ty)
+		fieldCount := int(C.wasmtime_component_record_type_field_count(recordTy))
+		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_RECORD)
+		C.go_component_val_init_record(out, C.size_t(fieldCount))
+		seen := make(map[string]struct{}, fieldCount)
+		for i := 0; i < fieldCount; i++ {
+			var nameP *C.char
+			var nameLen C.size_t
+			var fieldTy C.wasmtime_component_valtype_t
+			if !bool(C.wasmtime_component_record_type_field_nth(recordTy, C.size_t(i), &nameP, &nameLen, &fieldTy)) {
+				return fmt.Errorf("record field %d: could not retrieve type", i)
+			}
+			fieldName := C.GoStringN(nameP, C.int(nameLen))
+			val, present := entries[fieldName]
+			if !present {
+				C.wasmtime_component_valtype_delete(&fieldTy)
+				return fmt.Errorf("record field %q missing from input map", fieldName)
+			}
+			seen[fieldName] = struct{}{}
+			slot := C.go_component_val_record_set_name(out, C.size_t(i), C._GoStringPtr(fieldName), C._GoStringLen(fieldName))
+			runtime.KeepAlive(fieldName)
+			err := componentMarshalArg(val, &fieldTy, slot)
+			C.wasmtime_component_valtype_delete(&fieldTy)
+			if err != nil {
+				return fmt.Errorf("record field %q: %w", fieldName, err)
+			}
+		}
+		if len(seen) != len(entries) {
+			for k := range entries {
+				if _, ok := seen[k]; !ok {
+					return fmt.Errorf("record input has unexpected field %q", k)
+				}
+			}
+		}
 	default:
-		// TODO: support composite WIT types (list, record, tuple, variant,
-		// enum, option, result, flags, map) and resource types. The Go
-		// representation for these (especially variant/result, which Go
-		// has no native sum type for) is the design question to be worked
-		// out in a follow-up PR.
-		return fmt.Errorf("unsupported component type kind: %d (only primitive WIT types are supported in this version)", kind)
+		// TODO: support remaining composite WIT types (tuple, variant, enum,
+		// option, result, flags, map) and resource types.
+		return fmt.Errorf("unsupported component type kind: %d (string, list, record, and primitives are supported)", ty.kind)
 	}
 	return nil
 }
@@ -193,11 +279,37 @@ func componentUnmarshalVal(v *C.wasmtime_component_val_t) (interface{}, error) {
 		data := C.go_component_val_string_data(v)
 		size := C.go_component_val_string_size(v)
 		return C.GoStringN(data, C.int(size)), nil
+	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_LIST):
+		size := int(C.go_component_val_list_size(v))
+		out := make([]interface{}, size)
+		for i := 0; i < size; i++ {
+			elem := C.go_component_val_list_get(v, C.size_t(i))
+			val, err := componentUnmarshalVal((*C.wasmtime_component_val_t)(elem))
+			if err != nil {
+				return nil, fmt.Errorf("list[%d]: %w", i, err)
+			}
+			out[i] = val
+		}
+		return out, nil
+	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_RECORD):
+		size := int(C.go_component_val_record_size(v))
+		out := make(map[string]interface{}, size)
+		for i := 0; i < size; i++ {
+			nameP := C.go_component_val_record_name(v, C.size_t(i))
+			nameLen := C.go_component_val_record_name_size(v, C.size_t(i))
+			name := C.GoStringN(nameP, C.int(nameLen))
+			elem := C.go_component_val_record_get(v, C.size_t(i))
+			val, err := componentUnmarshalVal((*C.wasmtime_component_val_t)(elem))
+			if err != nil {
+				return nil, fmt.Errorf("record field %q: %w", name, err)
+			}
+			out[name] = val
+		}
+		return out, nil
 	default:
-		// TODO: support composite WIT types (list, record, tuple, variant,
-		// enum, option, result, flags, map) and resource types. See the
-		// matching TODO in componentMarshalArg.
-		return nil, fmt.Errorf("unsupported component value kind: %d (only primitive WIT types are supported in this version)", v.kind)
+		// TODO: support remaining composite WIT types (tuple, variant, enum,
+		// option, result, flags, map) and resource types.
+		return nil, fmt.Errorf("unsupported component value kind: %d (string, list, record, and primitives are supported)", v.kind)
 	}
 }
 
