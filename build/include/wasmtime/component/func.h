@@ -92,6 +92,21 @@ WASM_API_EXTERN wasmtime_call_future_t *wasmtime_component_func_call_async(
     wasmtime_component_val_t *results, size_t results_size,
     wasmtime_error_t **error_ret);
 
+/**
+ * \brief Invokes a component function through the Component Model concurrent
+ * event loop.
+ *
+ * This supports async-lifted Component Model exports and concurrent host
+ * functions. The returned future follows the same ownership rules as
+ * #wasmtime_component_func_call_async.
+ */
+WASM_API_EXTERN wasmtime_call_future_t *
+wasmtime_component_func_call_concurrent_async(
+    const wasmtime_component_func_t *func, wasmtime_context_t *context,
+    const wasmtime_component_val_t *args, size_t args_size,
+    wasmtime_component_val_t *results, size_t results_size,
+    wasmtime_error_t **error_ret);
+
 #endif // WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
 
 #ifdef __cplusplus

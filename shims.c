@@ -84,8 +84,9 @@ struct go_component_async_state {
   atomic_bool ready;
   atomic_bool cancelled;
   size_t callback;
-  wasmtime_context_t *context;
+  uintptr_t context_key;
   wasmtime_component_func_type_t *func_type;
+  wasmtime_component_async_waker_t *waker;
   wasmtime_component_val_t *args;
   size_t nargs;
   wasmtime_component_val_t *results;
@@ -104,6 +105,7 @@ static void component_async_state_release(go_component_async_state_t *state) {
   }
   free(state->staged_results);
   wasmtime_component_func_type_delete(state->func_type);
+  if (state->waker != NULL) wasmtime_component_async_waker_delete(state->waker);
   free(state);
 }
 
@@ -112,6 +114,7 @@ static DWORD WINAPI component_async_worker(LPVOID raw) {
   go_component_async_state_t *state = raw;
   goComponentAsyncWorker(state);
   atomic_store_explicit(&state->ready, true, memory_order_release);
+  wasmtime_component_async_waker_wake(state->waker);
   component_async_state_release(state);
   return 0;
 }
@@ -126,6 +129,7 @@ static void *component_async_worker(void *raw) {
   go_component_async_state_t *state = raw;
   goComponentAsyncWorker(state);
   atomic_store_explicit(&state->ready, true, memory_order_release);
+  wasmtime_component_async_waker_wake(state->waker);
   component_async_state_release(state);
   return NULL;
 }
@@ -161,6 +165,7 @@ static void component_async_trampoline(
     wasmtime_component_val_t *results,
     size_t nresults,
     wasmtime_error_t **error_ret,
+    const wasmtime_component_async_waker_t *waker,
     wasmtime_async_continuation_t *continuation_ret
 ) {
   go_component_async_state_t *state = calloc(1, sizeof(go_component_async_state_t));
@@ -172,8 +177,9 @@ static void component_async_trampoline(
   atomic_init(&state->ready, false);
   atomic_init(&state->cancelled, false);
   state->callback = (size_t)env;
-  state->context = context;
+  state->context_key = (uintptr_t)context;
   state->func_type = wasmtime_component_func_type_clone(ty);
+  state->waker = wasmtime_component_async_waker_clone(waker);
   state->nargs = nargs;
   state->results = results;
   state->nresults = nresults;
@@ -243,9 +249,34 @@ wasmtime_error_t *go_component_linker_instance_add_func_async(
     size_t name_len,
     size_t env
 ) {
-  return wasmtime_component_linker_instance_add_func_async(
+#if defined(__linux__) && defined(__x86_64__)
+  return wasmtime_component_linker_instance_add_func_concurrent(
       instance, name, name_len, component_async_trampoline, (void *)env,
       component_async_func_finalize);
+#else
+  (void)instance; (void)name; (void)name_len; (void)env;
+  return wasmtime_error_new("concurrent Component Model callbacks are unavailable for this platform archive");
+#endif
+}
+
+wasmtime_call_future_t *go_component_func_call_concurrent_async(
+    const wasmtime_component_func_t *func,
+    wasmtime_context_t *context,
+    const wasmtime_component_val_t *args,
+    size_t args_size,
+    wasmtime_component_val_t *results,
+    size_t results_size,
+    wasmtime_error_t **error_ret
+) {
+#if defined(__linux__) && defined(__x86_64__)
+  return wasmtime_component_func_call_concurrent_async(
+      func, context, args, args_size, results, results_size, error_ret);
+#else
+  (void)func; (void)context; (void)args; (void)args_size;
+  (void)results; (void)results_size;
+  *error_ret = wasmtime_error_new("concurrent Component Model calls are unavailable for this platform archive");
+  return NULL;
+#endif
 }
 
 wasmtime_error_t *go_wasmtime_error_new(const char *message, size_t message_len) {
@@ -259,7 +290,7 @@ wasmtime_error_t *go_wasmtime_error_new(const char *message, size_t message_len)
 }
 
 size_t go_component_async_state_callback(const go_component_async_state_t *state) { return state->callback; }
-wasmtime_context_t *go_component_async_state_context(const go_component_async_state_t *state) { return state->context; }
+size_t go_component_async_state_context_key(const go_component_async_state_t *state) { return state->context_key; }
 const wasmtime_component_func_type_t *go_component_async_state_func_type(const go_component_async_state_t *state) { return state->func_type; }
 wasmtime_component_val_t *go_component_async_state_args(const go_component_async_state_t *state) { return state->args; }
 size_t go_component_async_state_nargs(const go_component_async_state_t *state) { return state->nargs; }

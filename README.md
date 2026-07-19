@@ -184,3 +184,18 @@ $ git tag v46.0.0
 ```
 
 and push up the tag
+
+### Concurrent Component Model fork
+
+This branch adds the generic Component Model APIs needed for WIT `async func`
+imports and exports. The bundled Linux x86_64 archive is Wasmtime `v46.0.1`
+built with release LTO after applying
+`ci/patches/wasmtime-v46-concurrent-component-api.patch`. Rebuild it with:
+
+```sh
+ci/build-concurrent-component-runtime.sh /path/to/wasmtime-v46.0.1
+```
+
+Other bundled platform archives remain upstream `v46.0.1`; the new concurrent
+APIs return a clear unsupported error there until equivalent archives are
+published.

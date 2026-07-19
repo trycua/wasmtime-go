@@ -29,6 +29,7 @@ package wasmtime
 //   return copy;
 // }
 // static inline void go_component_func_copy_delete(wasmtime_component_func_t *func) { free(func); }
+// static inline const wasmtime_component_result_type_t *go_async_valtype_result(const wasmtime_component_valtype_t *ty) { return ty->of.result; }
 import "C"
 
 import (
@@ -106,9 +107,9 @@ func endComponentCall(ctx *C.wasmtime_context_t, state *componentCallState) {
 	componentCalls.Unlock()
 }
 
-func activeComponentCall(ctx *C.wasmtime_context_t) *componentCallState {
+func activeComponentCallKey(key uintptr) *componentCallState {
 	componentCalls.Lock()
-	state := componentCalls.byContext[componentContextKey(ctx)]
+	state := componentCalls.byContext[key]
 	componentCalls.Unlock()
 	return state
 }
@@ -144,7 +145,11 @@ func writeComponentAsyncResults(
 	value := values[0]
 	if callbackErr != nil || value == nil {
 		var defaultErr error
-		value, defaultErr = componentDefaultValue(&resultType)
+		if callbackErr != nil {
+			value, defaultErr = componentCallbackFailureValue(&resultType, callbackErr)
+		} else {
+			value, defaultErr = componentDefaultValue(&resultType)
+		}
 		if defaultErr != nil {
 			callState.recordError(defaultErr)
 			return
@@ -166,8 +171,8 @@ func writeComponentAsyncResults(
 
 //export goComponentAsyncWorker
 func goComponentAsyncWorker(state *C.go_component_async_state_t) {
-	wasmtimeContext := C.go_component_async_state_context(state)
-	callState := activeComponentCall(wasmtimeContext)
+	contextKey := uintptr(C.go_component_async_state_context_key(state))
+	callState := activeComponentCallKey(contextKey)
 	if callState == nil {
 		callState = &componentCallState{ctx: context.Background()}
 	}
@@ -408,7 +413,7 @@ func (function *ComponentFunc) CallAsync(ctx context.Context, store Storelike, a
 	}
 	defer C.go_component_func_copy_delete(funcCopy)
 
-	future := C.wasmtime_component_func_call_async(
+	future := C.go_component_func_call_concurrent_async(
 		funcCopy, storeContext, cArgs, C.size_t(paramCount), cResults, C.size_t(resultCount), errorSlot,
 	)
 	if future == nil {
@@ -451,4 +456,24 @@ func pollComponentFuture(ctx context.Context, future *C.wasmtime_call_future_t) 
 		case <-pollInterval.C:
 		}
 	}
+}
+
+func componentCallbackFailureValue(ty *C.wasmtime_component_valtype_t, callbackErr error) (interface{}, error) {
+	if ty.kind != C.WASMTIME_COMPONENT_VALTYPE_RESULT {
+		return componentDefaultValue(ty)
+	}
+	resultType := C.go_async_valtype_result(ty)
+	var errorType C.wasmtime_component_valtype_t
+	if !bool(C.wasmtime_component_result_type_err(resultType, &errorType)) {
+		return ComponentResult{OK: false}, nil
+	}
+	defer C.wasmtime_component_valtype_delete(&errorType)
+	if errorType.kind == C.WASMTIME_COMPONENT_VALTYPE_STRING {
+		return ComponentResult{OK: false, Value: callbackErr.Error()}, nil
+	}
+	value, err := componentDefaultValue(&errorType)
+	if err != nil {
+		return nil, fmt.Errorf("result error payload: %w", err)
+	}
+	return ComponentResult{OK: false, Value: value}, nil
 }

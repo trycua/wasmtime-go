@@ -267,6 +267,46 @@ wasmtime_component_linker_instance_add_func_async(
     size_t name_len, wasmtime_component_func_async_callback_t callback,
     void *data, void (*finalizer)(void *));
 
+typedef struct wasmtime_component_async_waker wasmtime_component_async_waker_t;
+
+/// Retains a concurrent callback wake handle.
+WASM_API_EXTERN wasmtime_component_async_waker_t *
+wasmtime_component_async_waker_clone(const wasmtime_component_async_waker_t *waker);
+
+/// Releases a retained concurrent callback wake handle.
+WASM_API_EXTERN void wasmtime_component_async_waker_delete(
+    wasmtime_component_async_waker_t *waker);
+
+/// Wakes the Component Model event loop after callback progress.
+WASM_API_EXTERN void wasmtime_component_async_waker_wake(
+    const wasmtime_component_async_waker_t *waker);
+
+/// Type of the callback used by concurrent Component Model host functions.
+/// Concurrent callbacks do not receive mutable store access because it cannot
+/// be retained across suspension points.
+typedef void (*wasmtime_component_func_concurrent_callback_t)(
+    void *env, wasmtime_context_t *context,
+    const wasmtime_component_func_type_t *ty,
+    wasmtime_component_val_t *args, size_t nargs,
+    wasmtime_component_val_t *results, size_t nresults,
+    wasmtime_error_t **error_ret,
+    const wasmtime_component_async_waker_t *waker,
+    wasmtime_async_continuation_t *continuation_ret);
+
+/**
+ * \brief Define a concurrent component function within this instance.
+ *
+ * Unlike #wasmtime_component_linker_instance_add_func_async, this definition
+ * matches Component Model `async func` imports and may be invoked concurrently
+ * by the guest. The callback receives temporary store context access during
+ * setup; it must not retain or use that context after returning.
+ */
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_instance_add_func_concurrent(
+    wasmtime_component_linker_instance_t *linker_instance, const char *name,
+    size_t name_len, wasmtime_component_func_concurrent_callback_t callback,
+    void *data, void (*finalizer)(void *));
+
 #ifdef WASMTIME_FEATURE_WASI
 
 /**

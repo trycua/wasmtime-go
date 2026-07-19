@@ -44,7 +44,7 @@ wasmtime_error_t *go_component_linker_instance_add_func_async(
 );
 wasmtime_error_t *go_wasmtime_error_new(const char *message, size_t message_len);
 size_t go_component_async_state_callback(const go_component_async_state_t *state);
-wasmtime_context_t *go_component_async_state_context(const go_component_async_state_t *state);
+size_t go_component_async_state_context_key(const go_component_async_state_t *state);
 const wasmtime_component_func_type_t *go_component_async_state_func_type(const go_component_async_state_t *state);
 wasmtime_component_val_t *go_component_async_state_args(const go_component_async_state_t *state);
 size_t go_component_async_state_nargs(const go_component_async_state_t *state);
@@ -52,3 +52,12 @@ wasmtime_component_val_t *go_component_async_state_results(const go_component_as
 size_t go_component_async_state_nresults(const go_component_async_state_t *state);
 bool go_component_async_state_cancelled(const go_component_async_state_t *state);
 #endif
+
+wasmtime_call_future_t *go_component_func_call_concurrent_async(
+    const wasmtime_component_func_t *func,
+    wasmtime_context_t *context,
+    const wasmtime_component_val_t *args,
+    size_t args_size,
+    wasmtime_component_val_t *results,
+    size_t results_size,
+    wasmtime_error_t **error_ret);

@@ -1,0 +1,256 @@
+diff --git a/crates/c-api/include/wasmtime/component/func.h b/crates/c-api/include/wasmtime/component/func.h
+index 2811610..283d6e8 100644
+--- a/crates/c-api/include/wasmtime/component/func.h
++++ b/crates/c-api/include/wasmtime/component/func.h
+@@ -92,6 +92,21 @@ WASM_API_EXTERN wasmtime_call_future_t *wasmtime_component_func_call_async(
+     wasmtime_component_val_t *results, size_t results_size,
+     wasmtime_error_t **error_ret);
+ 
++/**
++ * \brief Invokes a component function through the Component Model concurrent
++ * event loop.
++ *
++ * This supports async-lifted Component Model exports and concurrent host
++ * functions. The returned future follows the same ownership rules as
++ * #wasmtime_component_func_call_async.
++ */
++WASM_API_EXTERN wasmtime_call_future_t *
++wasmtime_component_func_call_concurrent_async(
++    const wasmtime_component_func_t *func, wasmtime_context_t *context,
++    const wasmtime_component_val_t *args, size_t args_size,
++    wasmtime_component_val_t *results, size_t results_size,
++    wasmtime_error_t **error_ret);
++
+ #endif // WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
+ 
+ #ifdef __cplusplus
+diff --git a/crates/c-api/include/wasmtime/component/linker.h b/crates/c-api/include/wasmtime/component/linker.h
+index aa6f76a..ed212ae 100644
+--- a/crates/c-api/include/wasmtime/component/linker.h
++++ b/crates/c-api/include/wasmtime/component/linker.h
+@@ -267,6 +267,46 @@ wasmtime_component_linker_instance_add_func_async(
+     size_t name_len, wasmtime_component_func_async_callback_t callback,
+     void *data, void (*finalizer)(void *));
+ 
++typedef struct wasmtime_component_async_waker wasmtime_component_async_waker_t;
++
++/// Retains a concurrent callback wake handle.
++WASM_API_EXTERN wasmtime_component_async_waker_t *
++wasmtime_component_async_waker_clone(const wasmtime_component_async_waker_t *waker);
++
++/// Releases a retained concurrent callback wake handle.
++WASM_API_EXTERN void wasmtime_component_async_waker_delete(
++    wasmtime_component_async_waker_t *waker);
++
++/// Wakes the Component Model event loop after callback progress.
++WASM_API_EXTERN void wasmtime_component_async_waker_wake(
++    const wasmtime_component_async_waker_t *waker);
++
++/// Type of the callback used by concurrent Component Model host functions.
++/// Concurrent callbacks do not receive mutable store access because it cannot
++/// be retained across suspension points.
++typedef void (*wasmtime_component_func_concurrent_callback_t)(
++    void *env, wasmtime_context_t *context,
++    const wasmtime_component_func_type_t *ty,
++    wasmtime_component_val_t *args, size_t nargs,
++    wasmtime_component_val_t *results, size_t nresults,
++    wasmtime_error_t **error_ret,
++    const wasmtime_component_async_waker_t *waker,
++    wasmtime_async_continuation_t *continuation_ret);
++
++/**
++ * \brief Define a concurrent component function within this instance.
++ *
++ * Unlike #wasmtime_component_linker_instance_add_func_async, this definition
++ * matches Component Model `async func` imports and may be invoked concurrently
++ * by the guest. The callback receives temporary store context access during
++ * setup; it must not retain or use that context after returning.
++ */
++WASM_API_EXTERN wasmtime_error_t *
++wasmtime_component_linker_instance_add_func_concurrent(
++    wasmtime_component_linker_instance_t *linker_instance, const char *name,
++    size_t name_len, wasmtime_component_func_concurrent_callback_t callback,
++    void *data, void (*finalizer)(void *));
++
+ #ifdef WASMTIME_FEATURE_WASI
+ 
+ /**
+diff --git a/crates/c-api/src/component/func.rs b/crates/c-api/src/component/func.rs
+index b879a56..4eb15ca 100644
+--- a/crates/c-api/src/component/func.rs
++++ b/crates/c-api/src/component/func.rs
+@@ -57,6 +57,41 @@ pub unsafe extern "C" fn wasmtime_component_func_call_async<'a>(
+     Box::new(crate::wasmtime_call_future_t::new(fut))
+ }
+ 
++#[unsafe(no_mangle)]
++#[cfg(feature = "component-model-async")]
++pub unsafe extern "C" fn wasmtime_component_func_call_concurrent_async<'a>(
++    func: &'a Func,
++    context: WasmtimeStoreContextMut<'a>,
++    args: *const wasmtime_component_val_t,
++    args_len: usize,
++    results: *mut wasmtime_component_val_t,
++    results_len: usize,
++    err_ret: &'a mut *mut wasmtime_error_t,
++) -> Box<crate::wasmtime_call_future_t<'a>> {
++    let c_args = unsafe { crate::slice_from_raw_parts(args, args_len) };
++    let c_results = unsafe { crate::slice_from_raw_parts_mut(results, results_len) };
++    let fut = Box::pin(async move {
++        let args = c_args.iter().map(Val::from).collect::<Vec<_>>();
++        let mut results = vec![Val::Bool(false); c_results.len()];
++        let call = context
++            .run_concurrent(async |accessor| {
++                func.call_concurrent(accessor, &args, &mut results).await
++            })
++            .await;
++        match call.and_then(|result| result) {
++            Ok(()) => {
++                for (c_val, rust_val) in std::iter::zip(c_results.iter_mut(), results) {
++                    *c_val = wasmtime_component_val_t::from(&rust_val);
++                }
++            }
++            Err(err) => {
++                *err_ret = Box::into_raw(Box::new(wasmtime_error_t::from(err)));
++            }
++        }
++    });
++    Box::new(crate::wasmtime_call_future_t::new(fut))
++}
++
+ #[deprecated(note = "no longer has any effect")]
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn wasmtime_component_func_post_return(
+diff --git a/crates/c-api/src/component/linker.rs b/crates/c-api/src/component/linker.rs
+index 3823b8b..5df74e4 100644
+--- a/crates/c-api/src/component/linker.rs
++++ b/crates/c-api/src/component/linker.rs
+@@ -3,6 +3,9 @@ use crate::{
+     wasmtime_component_resource_type_t, wasmtime_error_t, wasmtime_module_t,
+ };
+ use std::ffi::c_void;
++use std::sync::{Arc, Mutex};
++use std::task::Waker;
++use wasmtime::AsContextMut;
+ use wasmtime::component::{Instance, Linker, LinkerInstance, Val};
+ 
+ use super::{wasmtime_component_t, wasmtime_component_val_t};
+@@ -347,3 +350,118 @@ pub unsafe extern "C" fn wasmtime_component_linker_instance_delete(
+     _linker_instance: Box<wasmtime_component_linker_instance_t>,
+ ) {
+ }
++
++#[cfg(feature = "component-model-async")]
++pub type wasmtime_component_func_concurrent_callback_t = extern "C" fn(
++    *mut c_void,
++    WasmtimeStoreContextMut<'_>,
++    &wasmtime_component_func_type_t,
++    *mut wasmtime_component_val_t,
++    usize,
++    *mut wasmtime_component_val_t,
++    usize,
++    &mut Option<Box<wasmtime_error_t>>,
++    &wasmtime_component_async_waker_t,
++    &mut crate::wasmtime_async_continuation_t,
++);
++
++#[repr(C)]
++pub struct wasmtime_component_async_waker_t {
++    state: Arc<Mutex<Option<Waker>>>,
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wasmtime_component_async_waker_clone(
++    waker: &wasmtime_component_async_waker_t,
++) -> Box<wasmtime_component_async_waker_t> {
++    Box::new(wasmtime_component_async_waker_t {
++        state: Arc::clone(&waker.state),
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wasmtime_component_async_waker_delete(
++    _waker: Box<wasmtime_component_async_waker_t>,
++) {
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wasmtime_component_async_waker_wake(waker: &wasmtime_component_async_waker_t) {
++    let waker = waker.state.lock().unwrap().clone();
++    if let Some(waker) = waker {
++        waker.wake();
++    }
++}
++
++#[unsafe(no_mangle)]
++#[cfg(feature = "component-model-async")]
++pub unsafe extern "C" fn wasmtime_component_linker_instance_add_func_concurrent(
++    linker_instance: &mut wasmtime_component_linker_instance_t,
++    name: *const u8,
++    name_len: usize,
++    callback: wasmtime_component_func_concurrent_callback_t,
++    data: *mut c_void,
++    finalizer: Option<extern "C" fn(*mut c_void)>,
++) -> Option<Box<wasmtime_error_t>> {
++    let name = unsafe { std::slice::from_raw_parts(name, name_len) };
++    let Ok(name) = std::str::from_utf8(name) else {
++        return crate::bad_utf8();
++    };
++
++    let foreign = crate::ForeignData { data, finalizer };
++    let result = linker_instance.linker_instance.func_new_concurrent(
++        &name,
++        move |accessor, ty, args, rets| {
++            let _ = &foreign;
++            let mut c_args = args
++                .iter()
++                .map(|value| wasmtime_component_val_t::from(value))
++                .collect::<Vec<_>>();
++            let mut c_rets = vec![wasmtime_component_val_t::Bool(false); rets.len()];
++            let mut err = None;
++            extern "C" fn panic_callback(_: *mut c_void) -> bool {
++                panic!("callback must be set")
++            }
++            let mut continuation = crate::wasmtime_async_continuation_t {
++                callback: panic_callback,
++                env: std::ptr::null_mut(),
++                finalizer: None,
++            };
++            let wake_state = Arc::new(Mutex::new(None));
++            let wake_handle = wasmtime_component_async_waker_t {
++                state: Arc::clone(&wake_state),
++            };
++            accessor.with(|mut access| {
++                callback(
++                    foreign.data,
++                    access.as_context_mut(),
++                    &ty.into(),
++                    c_args.as_mut_ptr(),
++                    c_args.len(),
++                    c_rets.as_mut_ptr(),
++                    c_rets.len(),
++                    &mut err,
++                    &wake_handle,
++                    &mut continuation,
++                );
++            });
++
++            Box::pin(async move {
++                if let Some(err) = err {
++                    return Err((*err).into());
++                }
++                std::future::poll_fn(|cx| {
++                    *wake_state.lock().unwrap() = Some(cx.waker().clone());
++                    std::future::Future::poll(std::pin::Pin::new(&mut continuation), cx)
++                })
++                .await;
++                for (rust_val, c_val) in std::iter::zip(rets, c_rets) {
++                    *rust_val = Val::from(&c_val);
++                }
++                Ok(())
++            })
++        },
++    );
++
++    crate::handle_result(result, |_| ())
++}
