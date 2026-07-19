@@ -513,6 +513,100 @@ func componentArgMismatch(expected string, got interface{}) error {
 	return fmt.Errorf("type mismatch: expected %s, got %T", expected, got)
 }
 
+func componentDefaultValue(ty *C.wasmtime_component_valtype_t) (interface{}, error) {
+	switch ty.kind {
+	case C.WASMTIME_COMPONENT_VALTYPE_BOOL:
+		return false, nil
+	case C.WASMTIME_COMPONENT_VALTYPE_S8:
+		return int8(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_U8:
+		return uint8(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_S16:
+		return int16(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_U16:
+		return uint16(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_S32, C.WASMTIME_COMPONENT_VALTYPE_CHAR:
+		return int32(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_U32:
+		return uint32(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_S64:
+		return int64(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_U64:
+		return uint64(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_F32:
+		return float32(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_F64:
+		return float64(0), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_STRING:
+		return "", nil
+	case C.WASMTIME_COMPONENT_VALTYPE_LIST:
+		return []interface{}{}, nil
+	case C.WASMTIME_COMPONENT_VALTYPE_RECORD:
+		recordTy := C.go_valtype_record(ty)
+		fieldCount := int(C.wasmtime_component_record_type_field_count(recordTy))
+		result := make(map[string]interface{}, fieldCount)
+		for index := 0; index < fieldCount; index++ {
+			var nameP *C.char
+			var nameLen C.size_t
+			var fieldTy C.wasmtime_component_valtype_t
+			if !bool(C.wasmtime_component_record_type_field_nth(recordTy, C.size_t(index), &nameP, &nameLen, &fieldTy)) {
+				return nil, fmt.Errorf("record field %d: could not retrieve type", index)
+			}
+			name := C.GoStringN(nameP, C.int(nameLen))
+			value, err := componentDefaultValue(&fieldTy)
+			C.wasmtime_component_valtype_delete(&fieldTy)
+			if err != nil {
+				return nil, fmt.Errorf("record field %q: %w", name, err)
+			}
+			result[name] = value
+		}
+		return result, nil
+	case C.WASMTIME_COMPONENT_VALTYPE_ENUM:
+		enumTy := C.go_valtype_enum(ty)
+		var nameP *C.char
+		var nameLen C.size_t
+		if !bool(C.wasmtime_component_enum_type_names_nth(enumTy, 0, &nameP, &nameLen)) {
+			return nil, fmt.Errorf("component enum has no cases")
+		}
+		return ComponentEnum(C.GoStringN(nameP, C.int(nameLen))), nil
+	case C.WASMTIME_COMPONENT_VALTYPE_OPTION:
+		return ComponentOption{}, nil
+	case C.WASMTIME_COMPONENT_VALTYPE_RESULT:
+		resultTy := C.go_valtype_result(ty)
+		var okTy C.wasmtime_component_valtype_t
+		if !bool(C.wasmtime_component_result_type_ok(resultTy, &okTy)) {
+			return ComponentResult{OK: true}, nil
+		}
+		value, err := componentDefaultValue(&okTy)
+		C.wasmtime_component_valtype_delete(&okTy)
+		if err != nil {
+			return nil, fmt.Errorf("result ok payload: %w", err)
+		}
+		return ComponentResult{OK: true, Value: value}, nil
+	case C.WASMTIME_COMPONENT_VALTYPE_VARIANT:
+		variantTy := C.go_valtype_variant(ty)
+		var nameP *C.char
+		var nameLen C.size_t
+		var hasPayload C.bool
+		var payloadTy C.wasmtime_component_valtype_t
+		if !bool(C.wasmtime_component_variant_type_case_nth(variantTy, 0, &nameP, &nameLen, &hasPayload, &payloadTy)) {
+			return nil, fmt.Errorf("component variant has no cases")
+		}
+		result := ComponentVariant{Case: C.GoStringN(nameP, C.int(nameLen))}
+		if bool(hasPayload) {
+			value, err := componentDefaultValue(&payloadTy)
+			C.wasmtime_component_valtype_delete(&payloadTy)
+			if err != nil {
+				return nil, fmt.Errorf("variant %q payload: %w", result.Case, err)
+			}
+			result.Value = value
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("no default value for component type kind %d", ty.kind)
+	}
+}
+
 func componentNewPayload(value interface{}, ty *C.wasmtime_component_valtype_t) (*C.wasmtime_component_val_t, error) {
 	var temporary C.wasmtime_component_val_t
 	if err := componentMarshalArg(value, ty, &temporary); err != nil {

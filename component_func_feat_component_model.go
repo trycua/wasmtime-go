@@ -34,14 +34,18 @@ func mkComponentFunc(val C.wasmtime_component_func_t) *ComponentFunc {
 //   - WIT `f32`/`f64`        <-> Go `float32`/`float64`
 //   - WIT `char`             <-> Go `rune` (or `int32`)
 //   - WIT `string`           <-> Go `string`
+//   - WIT `list<T>`          <-> Go `[]interface{}`
+//   - WIT `record`           <-> Go `map[string]interface{}`
+//   - WIT `enum`             <-> Go [ComponentEnum]
+//   - WIT `option<T>`        <-> Go [ComponentOption]
+//   - WIT `result<T, E>`     <-> Go [ComponentResult]
+//   - WIT `variant`          <-> Go [ComponentVariant]
 //
-// Functions whose signatures use composite types (list, record, tuple,
-// variant, enum, option, result, flags, resource) are not yet supported and
-// will return an error indicating an unsupported type kind.
+// Tuple, flags, map, and resource values are not yet supported.
 //
 // The result is `nil` for void functions and a single Go value otherwise. WIT
 // only supports zero or one result, so multi-value returns are represented as
-// a tuple at the WIT level (and are unsupported here for now).
+// a tuple at the WIT level.
 func (f *ComponentFunc) Call(store Storelike, args ...interface{}) (interface{}, error) {
 	// 1. Look up the function's type so we know which WIT kind each parameter
 	// expects. The result type is also needed to size the result buffer. The

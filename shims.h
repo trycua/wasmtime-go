@@ -33,3 +33,22 @@ wasmtime_error_t *go_linker_define_func(
 EACH_UNION_ACCESSOR(UNION_ACCESSOR)
 
 #undef UNION_ACCESSOR
+
+#ifdef WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
+typedef struct go_component_async_state go_component_async_state_t;
+wasmtime_error_t *go_component_linker_instance_add_func_async(
+    wasmtime_component_linker_instance_t *instance,
+    const char *name,
+    size_t name_len,
+    size_t env
+);
+wasmtime_error_t *go_wasmtime_error_new(const char *message, size_t message_len);
+size_t go_component_async_state_callback(const go_component_async_state_t *state);
+wasmtime_context_t *go_component_async_state_context(const go_component_async_state_t *state);
+const wasmtime_component_func_type_t *go_component_async_state_func_type(const go_component_async_state_t *state);
+wasmtime_component_val_t *go_component_async_state_args(const go_component_async_state_t *state);
+size_t go_component_async_state_nargs(const go_component_async_state_t *state);
+wasmtime_component_val_t *go_component_async_state_results(const go_component_async_state_t *state);
+size_t go_component_async_state_nresults(const go_component_async_state_t *state);
+bool go_component_async_state_cancelled(const go_component_async_state_t *state);
+#endif
