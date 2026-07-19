@@ -344,3 +344,101 @@ func TestComponentCallStringRoundtrip(t *testing.T) {
 		})
 	}
 }
+
+const sumTypeTestComponent = `
+(component
+  (type $e' (enum "a" "b"))
+  (export $e "e" (type $e'))
+  (type $o' (option string))
+  (export $o "o" (type $o'))
+  (type $r' (result string (error string)))
+  (export $r "r" (type $r'))
+  (type $v' (variant (case "none") (case "text" string)))
+  (export $v "v" (type $v'))
+  (core module $m
+    (func (export "id-i32") (param i32) (result i32) local.get 0)
+    (func (export "id-wide") (param i32 i32 i32) (result i32)
+      (local $ret i32)
+      i32.const 2048
+      local.set $ret
+      local.get $ret
+      local.get 0
+      i32.store
+      local.get $ret
+      local.get 1
+      i32.store offset=4
+      local.get $ret
+      local.get 2
+      i32.store offset=8
+      local.get $ret)
+    (memory (export "memory") 1)
+    (global $next (mut i32) (i32.const 1024))
+    (func (export "cabi_realloc")
+      (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      global.get $next
+      local.tee $ret
+      local.get 3
+      i32.add
+      global.set $next
+      local.get $ret))
+  (core instance $i (instantiate $m))
+  (func (export "id-enum") (param "x" $e) (result $e)
+    (canon lift (core func $i "id-i32")))
+  (func (export "id-option") (param "x" $o) (result $o)
+    (canon lift (core func $i "id-wide") (memory $i "memory") (realloc (func $i "cabi_realloc"))))
+  (func (export "id-result") (param "x" $r) (result $r)
+    (canon lift (core func $i "id-wide") (memory $i "memory") (realloc (func $i "cabi_realloc"))))
+  (func (export "id-variant") (param "x" $v) (result $v)
+    (canon lift (core func $i "id-wide") (memory $i "memory") (realloc (func $i "cabi_realloc")))))
+`
+
+func setupSumTypeTest(t *testing.T) (*Store, *ComponentInstance) {
+	t.Helper()
+	engine := newComponentEngine()
+	store := NewStore(engine)
+	wasm, err := Wat2Wasm(sumTypeTestComponent)
+	require.NoError(t, err)
+	component, err := NewComponent(engine, wasm)
+	require.NoError(t, err)
+	t.Cleanup(component.Close)
+	linker := NewComponentLinker(engine)
+	t.Cleanup(linker.Close)
+	instance, err := linker.Instantiate(store, component)
+	require.NoError(t, err)
+	return store, instance
+}
+
+func TestComponentCallEnum(t *testing.T) {
+	store, instance := setupSumTypeTest(t)
+	got, err := instance.GetFunc(store, "id-enum").Call(store, ComponentEnum("b"))
+	require.NoError(t, err)
+	require.Equal(t, ComponentEnum("b"), got)
+}
+
+func TestComponentCallOption(t *testing.T) {
+	store, instance := setupSumTypeTest(t)
+	for _, want := range []ComponentOption{{}, {Some: true, Value: "hello"}} {
+		got, err := instance.GetFunc(store, "id-option").Call(store, want)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+}
+
+func TestComponentCallResult(t *testing.T) {
+	store, instance := setupSumTypeTest(t)
+	for _, want := range []ComponentResult{{OK: true, Value: "ok"}, {OK: false, Value: "error"}} {
+		got, err := instance.GetFunc(store, "id-result").Call(store, want)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+}
+
+func TestComponentCallVariant(t *testing.T) {
+	store, instance := setupSumTypeTest(t)
+	for _, want := range []ComponentVariant{{Case: "none"}, {Case: "text", Value: "hello"}} {
+		got, err := instance.GetFunc(store, "id-variant").Call(store, want)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+}

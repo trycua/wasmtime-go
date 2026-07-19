@@ -52,6 +52,10 @@ package wasmtime
 // // these accessors do not transfer ownership.
 // static inline const wasmtime_component_list_type_t *go_valtype_list(const wasmtime_component_valtype_t *t) { return t->of.list; }
 // static inline const wasmtime_component_record_type_t *go_valtype_record(const wasmtime_component_valtype_t *t) { return t->of.record; }
+// static inline const wasmtime_component_variant_type_t *go_valtype_variant(const wasmtime_component_valtype_t *t) { return t->of.variant; }
+// static inline const wasmtime_component_enum_type_t *go_valtype_enum(const wasmtime_component_valtype_t *t) { return t->of.enum_; }
+// static inline const wasmtime_component_option_type_t *go_valtype_option(const wasmtime_component_valtype_t *t) { return t->of.option; }
+// static inline const wasmtime_component_result_type_t *go_valtype_result(const wasmtime_component_valtype_t *t) { return t->of.result; }
 //
 // // list val helpers. The value's `of.list` is a vec of component_val_t.
 // static inline void go_component_val_init_list(wasmtime_component_val_t *v, size_t n) {
@@ -75,6 +79,35 @@ package wasmtime
 // static inline const char *go_component_val_record_name(const wasmtime_component_val_t *v, size_t i) { return v->of.record.data[i].name.data; }
 // static inline size_t go_component_val_record_name_size(const wasmtime_component_val_t *v, size_t i) { return v->of.record.data[i].name.size; }
 // static inline const wasmtime_component_val_t *go_component_val_record_get(const wasmtime_component_val_t *v, size_t i) { return &v->of.record.data[i].val; }
+//
+// // sum-type helpers. Payload pointers are allocated by
+// // wasmtime_component_val_new and are recursively released by
+// // wasmtime_component_val_delete.
+// static inline void go_component_val_set_enum(wasmtime_component_val_t *v, const char *name, size_t name_len) {
+//   wasm_name_new_uninitialized(&v->of.enumeration, name_len);
+//   if (name_len > 0) memcpy(v->of.enumeration.data, name, name_len);
+// }
+// static inline const char *go_component_val_enum_name(const wasmtime_component_val_t *v) { return v->of.enumeration.data; }
+// static inline size_t go_component_val_enum_name_size(const wasmtime_component_val_t *v) { return v->of.enumeration.size; }
+//
+// static inline void go_component_val_set_variant(wasmtime_component_val_t *v, const char *name, size_t name_len, wasmtime_component_val_t *payload) {
+//   wasm_name_new_uninitialized(&v->of.variant.discriminant, name_len);
+//   if (name_len > 0) memcpy(v->of.variant.discriminant.data, name, name_len);
+//   v->of.variant.val = payload;
+// }
+// static inline const char *go_component_val_variant_name(const wasmtime_component_val_t *v) { return v->of.variant.discriminant.data; }
+// static inline size_t go_component_val_variant_name_size(const wasmtime_component_val_t *v) { return v->of.variant.discriminant.size; }
+// static inline const wasmtime_component_val_t *go_component_val_variant_payload(const wasmtime_component_val_t *v) { return v->of.variant.val; }
+//
+// static inline void go_component_val_set_option(wasmtime_component_val_t *v, wasmtime_component_val_t *payload) { v->of.option = payload; }
+// static inline const wasmtime_component_val_t *go_component_val_option_payload(const wasmtime_component_val_t *v) { return v->of.option; }
+//
+// static inline void go_component_val_set_result(wasmtime_component_val_t *v, bool is_ok, wasmtime_component_val_t *payload) {
+//   v->of.result.is_ok = is_ok;
+//   v->of.result.val = payload;
+// }
+// static inline bool go_component_val_result_is_ok(const wasmtime_component_val_t *v) { return v->of.result.is_ok; }
+// static inline const wasmtime_component_val_t *go_component_val_result_payload(const wasmtime_component_val_t *v) { return v->of.result.val; }
 import "C"
 
 import (
@@ -82,10 +115,31 @@ import (
 	"runtime"
 )
 
+// ComponentEnum represents a WIT enum discriminant.
+type ComponentEnum string
+
+// ComponentOption represents a WIT option. Some distinguishes none from a
+// present zero value.
+type ComponentOption struct {
+	Some  bool
+	Value interface{}
+}
+
+// ComponentResult represents a WIT result. OK selects the ok or error case.
+type ComponentResult struct {
+	OK    bool
+	Value interface{}
+}
+
+// ComponentVariant represents a named WIT variant case and its optional payload.
+type ComponentVariant struct {
+	Case  string
+	Value interface{}
+}
+
 // componentMarshalArg writes the Go value `arg` into the C-side `out` slot,
-// matching the WIT type described by `ty`. Supports primitive types, string,
-// list<T>, and record { ... }. Composite types recurse into the appropriate
-// field types via the same function.
+// matching the WIT type described by `ty`. Composite types recurse into the
+// appropriate field types via the same function.
 //
 // `ty` is owned by the caller and is not consumed.
 func componentMarshalArg(arg interface{}, ty *C.wasmtime_component_valtype_t, out *C.wasmtime_component_val_t) error {
@@ -239,16 +293,125 @@ func componentMarshalArg(arg interface{}, ty *C.wasmtime_component_valtype_t, ou
 				}
 			}
 		}
+	case C.WASMTIME_COMPONENT_VALTYPE_ENUM:
+		value, ok := arg.(ComponentEnum)
+		if !ok {
+			return componentArgMismatch("wasmtime.ComponentEnum", arg)
+		}
+		name := string(value)
+		enumTy := C.go_valtype_enum(ty)
+		valid := false
+		for i, count := 0, int(C.wasmtime_component_enum_type_names_count(enumTy)); i < count; i++ {
+			var nameP *C.char
+			var nameLen C.size_t
+			if bool(C.wasmtime_component_enum_type_names_nth(enumTy, C.size_t(i), &nameP, &nameLen)) && C.GoStringN(nameP, C.int(nameLen)) == name {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("unknown enum discriminant %q", name)
+		}
+		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_ENUM)
+		C.go_component_val_set_enum(out, C._GoStringPtr(name), C._GoStringLen(name))
+		runtime.KeepAlive(name)
+	case C.WASMTIME_COMPONENT_VALTYPE_OPTION:
+		value, ok := arg.(ComponentOption)
+		if !ok {
+			return componentArgMismatch("wasmtime.ComponentOption", arg)
+		}
+		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_OPTION)
+		if !value.Some {
+			if value.Value != nil {
+				return fmt.Errorf("option none cannot have a payload")
+			}
+			C.go_component_val_set_option(out, nil)
+			break
+		}
+		var payloadTy C.wasmtime_component_valtype_t
+		C.wasmtime_component_option_type_ty(C.go_valtype_option(ty), &payloadTy)
+		defer C.wasmtime_component_valtype_delete(&payloadTy)
+		payload, err := componentNewPayload(value.Value, &payloadTy)
+		if err != nil {
+			return fmt.Errorf("option payload: %w", err)
+		}
+		C.go_component_val_set_option(out, payload)
+	case C.WASMTIME_COMPONENT_VALTYPE_RESULT:
+		value, ok := arg.(ComponentResult)
+		if !ok {
+			return componentArgMismatch("wasmtime.ComponentResult", arg)
+		}
+		resultTy := C.go_valtype_result(ty)
+		var payloadTy C.wasmtime_component_valtype_t
+		var hasPayload bool
+		if value.OK {
+			hasPayload = bool(C.wasmtime_component_result_type_ok(resultTy, &payloadTy))
+		} else {
+			hasPayload = bool(C.wasmtime_component_result_type_err(resultTy, &payloadTy))
+		}
+		var payload *C.wasmtime_component_val_t
+		if hasPayload {
+			var err error
+			payload, err = componentNewPayload(value.Value, &payloadTy)
+			C.wasmtime_component_valtype_delete(&payloadTy)
+			if err != nil {
+				return fmt.Errorf("result payload: %w", err)
+			}
+		} else if value.Value != nil {
+			return fmt.Errorf("result case has no payload")
+		}
+		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_RESULT)
+		C.go_component_val_set_result(out, C.bool(value.OK), payload)
+	case C.WASMTIME_COMPONENT_VALTYPE_VARIANT:
+		value, ok := arg.(ComponentVariant)
+		if !ok {
+			return componentArgMismatch("wasmtime.ComponentVariant", arg)
+		}
+		variantTy := C.go_valtype_variant(ty)
+		var payload *C.wasmtime_component_val_t
+		found := false
+		for i, count := 0, int(C.wasmtime_component_variant_type_case_count(variantTy)); i < count; i++ {
+			var nameP *C.char
+			var nameLen C.size_t
+			var hasPayload C.bool
+			var payloadTy C.wasmtime_component_valtype_t
+			if !bool(C.wasmtime_component_variant_type_case_nth(variantTy, C.size_t(i), &nameP, &nameLen, &hasPayload, &payloadTy)) {
+				continue
+			}
+			if C.GoStringN(nameP, C.int(nameLen)) != value.Case {
+				if bool(hasPayload) {
+					C.wasmtime_component_valtype_delete(&payloadTy)
+				}
+				continue
+			}
+			found = true
+			if bool(hasPayload) {
+				var err error
+				payload, err = componentNewPayload(value.Value, &payloadTy)
+				C.wasmtime_component_valtype_delete(&payloadTy)
+				if err != nil {
+					return fmt.Errorf("variant %q payload: %w", value.Case, err)
+				}
+			} else if value.Value != nil {
+				return fmt.Errorf("variant case %q has no payload", value.Case)
+			}
+			break
+		}
+		if !found {
+			return fmt.Errorf("unknown variant case %q", value.Case)
+		}
+		out.kind = C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_VARIANT)
+		C.go_component_val_set_variant(out, C._GoStringPtr(value.Case), C._GoStringLen(value.Case), payload)
+		runtime.KeepAlive(value.Case)
 	default:
-		// TODO: support remaining composite WIT types (tuple, variant, enum,
-		// option, result, flags, map) and resource types.
-		return fmt.Errorf("unsupported component type kind: %d (string, list, record, and primitives are supported)", ty.kind)
+		// TODO: support tuple, flags, map, and resource types.
+		return fmt.Errorf("unsupported component type kind: %d", ty.kind)
 	}
 	return nil
 }
 
 // componentUnmarshalVal converts a C-side `wasmtime_component_val_t` into a
-// Go value. Only primitive WIT types are supported in this version.
+// Go value.
 func componentUnmarshalVal(v *C.wasmtime_component_val_t) (interface{}, error) {
 	switch v.kind {
 	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_BOOL):
@@ -306,13 +469,60 @@ func componentUnmarshalVal(v *C.wasmtime_component_val_t) (interface{}, error) {
 			out[name] = val
 		}
 		return out, nil
+	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_ENUM):
+		return ComponentEnum(C.GoStringN(C.go_component_val_enum_name(v), C.int(C.go_component_val_enum_name_size(v)))), nil
+	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_OPTION):
+		payload := C.go_component_val_option_payload(v)
+		if payload == nil {
+			return ComponentOption{}, nil
+		}
+		value, err := componentUnmarshalVal((*C.wasmtime_component_val_t)(payload))
+		if err != nil {
+			return nil, fmt.Errorf("option payload: %w", err)
+		}
+		return ComponentOption{Some: true, Value: value}, nil
+	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_RESULT):
+		ok := bool(C.go_component_val_result_is_ok(v))
+		payload := C.go_component_val_result_payload(v)
+		if payload == nil {
+			return ComponentResult{OK: ok}, nil
+		}
+		value, err := componentUnmarshalVal((*C.wasmtime_component_val_t)(payload))
+		if err != nil {
+			return nil, fmt.Errorf("result payload: %w", err)
+		}
+		return ComponentResult{OK: ok, Value: value}, nil
+	case C.wasmtime_component_valkind_t(C.WASMTIME_COMPONENT_VARIANT):
+		name := C.GoStringN(C.go_component_val_variant_name(v), C.int(C.go_component_val_variant_name_size(v)))
+		payload := C.go_component_val_variant_payload(v)
+		if payload == nil {
+			return ComponentVariant{Case: name}, nil
+		}
+		value, err := componentUnmarshalVal((*C.wasmtime_component_val_t)(payload))
+		if err != nil {
+			return nil, fmt.Errorf("variant %q payload: %w", name, err)
+		}
+		return ComponentVariant{Case: name, Value: value}, nil
 	default:
-		// TODO: support remaining composite WIT types (tuple, variant, enum,
-		// option, result, flags, map) and resource types.
-		return nil, fmt.Errorf("unsupported component value kind: %d (string, list, record, and primitives are supported)", v.kind)
+		// TODO: support tuple, flags, map, and resource types.
+		return nil, fmt.Errorf("unsupported component value kind: %d", v.kind)
 	}
 }
 
 func componentArgMismatch(expected string, got interface{}) error {
 	return fmt.Errorf("type mismatch: expected %s, got %T", expected, got)
+}
+
+func componentNewPayload(value interface{}, ty *C.wasmtime_component_valtype_t) (*C.wasmtime_component_val_t, error) {
+	var temporary C.wasmtime_component_val_t
+	if err := componentMarshalArg(value, ty, &temporary); err != nil {
+		C.wasmtime_component_val_delete(&temporary)
+		return nil, err
+	}
+	payload := C.wasmtime_component_val_new(&temporary)
+	C.wasmtime_component_val_delete(&temporary)
+	if payload == nil {
+		return nil, fmt.Errorf("could not allocate component payload")
+	}
+	return payload, nil
 }
