@@ -184,6 +184,7 @@ static void component_async_trampoline(
   state->results = results;
   state->nresults = nresults;
   if (state->func_type == NULL) {
+    wasmtime_component_async_waker_delete(state->waker);
     free(state);
     *error_ret = wasmtime_error_new("failed to clone async component function type");
     return;
@@ -192,6 +193,7 @@ static void component_async_trampoline(
     state->staged_results = calloc(nresults, sizeof(wasmtime_component_val_t));
     if (state->staged_results == NULL) {
       wasmtime_component_func_type_delete(state->func_type);
+      wasmtime_component_async_waker_delete(state->waker);
       free(state);
       *error_ret = wasmtime_error_new("failed to allocate async component results");
       return;
@@ -202,6 +204,7 @@ static void component_async_trampoline(
     if (state->args == NULL) {
       free(state->staged_results);
       wasmtime_component_func_type_delete(state->func_type);
+      wasmtime_component_async_waker_delete(state->waker);
       free(state);
       *error_ret = wasmtime_error_new("failed to allocate async component arguments");
       return;
