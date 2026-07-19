@@ -3,8 +3,8 @@ module test-minimal-runtime
 go 1.18
 
 require (
-	github.com/trycua/wasmtime-go/v46 v46.0.0
 	github.com/stretchr/testify v1.8.0
+	github.com/trycua/wasmtime-go/v46 v46.0.0
 )
 
 require (
